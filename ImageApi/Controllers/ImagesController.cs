@@ -39,6 +39,38 @@ public class ImagesController : ControllerBase
         return Ok(image);
     }
 
+    [HttpGet("{id}/resize/{height:int}")]
+    public async Task<IActionResult> GetResizedImageByHeight(string id, int height)
+    {
+        var image = await _imageService.GetImageByIdAsync(id);
+        if (image == null)
+            return NotFound($"Image with ID {id} not found.");
+
+        if (height > image.OriginalHeight)
+            return BadRequest("Requested height cannot be greater than original image height.");
+
+        var result = await _imageService.GetResizedImageAsync(id, null, height);
+        if (result == null)
+            return NotFound($"Could not generate resized image.");
+
+        return File(result.Stream, result.ContentType, result.FileName);
+    }
+
+    [HttpGet("{id}/resize/{height:int}/url")]
+    public async Task<IActionResult> GetResizedImageUrl(string id, int height)
+    {
+        var result = await _imageService.GetResizedImageUrlAsync(id, height);
+
+        if (result == null)
+            return NotFound($"Image with ID {id} not found.");
+
+        if (result.Error != null)
+            return BadRequest(result.Error);
+
+        return Ok(result);
+    }
+
+
     [HttpGet("{id}/download")]
     public async Task<IActionResult> DownloadImage(string id)
     {

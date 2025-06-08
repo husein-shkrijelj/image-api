@@ -20,7 +20,10 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// 2. Register DbContext with connection string from configuration
+// 2. Add Memory Cache FIRST - before other services that depend on it
+builder.Services.AddMemoryCache();
+
+// 3. Register DbContext with connection string from configuration
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 builder.Services.AddDbContext<ImageDbContext>(options =>
     options.UseSqlServer(connectionString, sqlOptions =>
@@ -35,14 +38,14 @@ builder.Services.AddDbContext<ImageDbContext>(options =>
 builder.Services.Configure<AzureBlobSettings>(
     builder.Configuration.GetSection(nameof(AzureBlobSettings)));
 
-// 3. Register application and infrastructure services
+// 4. Register application and infrastructure services
 builder.Services.AddScoped<IImageService, ImageService>();
 builder.Services.AddScoped<IAzureBlobStorageService, AzureBlobStorageService>();
 builder.Services.AddScoped<IImageRepository, ImageRepository>();
 
 var app = builder.Build();
 
-// 4. Configure the HTTP request pipeline.
+// 5. Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment() || app.Environment.EnvironmentName == "Local")
 {
     app.UseSwagger();

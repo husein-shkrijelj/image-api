@@ -27,5 +27,9 @@ namespace ImageApi.Domain.Entities
         public string? Description { get; set; }
         
         public string? Metadata { get; set; }
+                
+        public bool IsCompressed { get; set; } = false;
+        
+        public string CompressionType { get; set; } = "none";
     }
 }

@@ -30,15 +30,21 @@ namespace ImageApi.Infrastructure.Data
                 entity.Property(e => e.OriginalWidth).IsRequired();
                 entity.Property(e => e.UploadedAt).IsRequired();
                 
-                // New fields
+                // Existing optional fields
                 entity.Property(e => e.UpdatedAt).IsRequired(false); // Nullable
                 entity.Property(e => e.FileExtension).HasMaxLength(10).IsRequired();
                 entity.Property(e => e.Description).HasMaxLength(500).IsRequired(false); // Nullable
                 entity.Property(e => e.Metadata).HasMaxLength(1000).IsRequired(false); // Nullable
                 
+                // New compression fields
+                entity.Property(e => e.IsCompressed).IsRequired();
+                entity.Property(e => e.CompressionType).HasMaxLength(20).IsRequired();
+                
                 // Set default values
                 entity.Property(e => e.UploadedAt).HasDefaultValueSql("GETUTCDATE()");
                 entity.Property(e => e.FileExtension).HasDefaultValue(".png");
+                entity.Property(e => e.IsCompressed).HasDefaultValue(false);
+                entity.Property(e => e.CompressionType).HasDefaultValue("none");
             });
         }
     }

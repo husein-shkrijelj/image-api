@@ -8,7 +8,7 @@ public interface IImageService
 {
     // Create
     Task<ImageUploadResultDto> UploadImageAsync(IFormFile file);
-    
+
     // Read
     Task<IEnumerable<ImageInfo>> GetAllImagesAsync();
     Task<ImageInfo?> GetImageByIdAsync(string id);
@@ -16,16 +16,19 @@ public interface IImageService
     Task<ImageDownloadResultDto?> DownloadImageWithResolutionAsync(string id, string resolution);
     Task<ImageDownloadResultDto?> GetResizedImageAsync(string id, int? width, int? height);
     Task<IEnumerable<string>?> GetAvailableResolutionsAsync(string id);
-    
+
     // Update
     Task<ImageUploadResultDto?> UpdateImageAsync(string id, IFormFile file);
-    
+
     // Delete
     Task<bool> DeleteImageAsync(string id);
-    
+
     // Resolution management
     Task<ResolutionGenerationResultDto?> GeneratePredefinedResolutionsAsync(string id);
-    
+
     // Legacy method for backward compatibility
     Task<string?> GetResizedImagePathAsync(string imageId, int height);
+
+    Task<ResizedImageUrlResultDto?> GetResizedImageUrlAsync(string id, int height);
+
 }
