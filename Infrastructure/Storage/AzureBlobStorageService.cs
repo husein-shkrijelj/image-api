@@ -21,23 +21,81 @@ public class AzureBlobStorageService : IAzureBlobStorageService
 
     public async Task UploadAsync(string blobName, Stream content)
     {
-        var blob = _containerClient.GetBlobClient(blobName);
-        await blob.UploadAsync(content, overwrite: true);
+        try
+        {
+            var blob = _containerClient.GetBlobClient(blobName);
+            await blob.UploadAsync(content, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to upload blob '{blobName}': {ex.Message}", ex);
+        }
     }
 
     public async Task<Stream> DownloadAsync(string blobName)
     {
-        var blob = _containerClient.GetBlobClient(blobName);
-        var response = await blob.DownloadAsync();
-        var memoryStream = new MemoryStream();
-        await response.Value.Content.CopyToAsync(memoryStream);
-        memoryStream.Position = 0;
-        return memoryStream;
+        try
+        {
+            var blob = _containerClient.GetBlobClient(blobName);
+            
+            // Check if blob exists first
+            var exists = await blob.ExistsAsync();
+            if (!exists.Value)
+            {
+                throw new FileNotFoundException($"Blob '{blobName}' not found.");
+            }
+
+            var response = await blob.DownloadStreamingAsync();
+            
+            // Create a new MemoryStream to hold the blob content
+            var memoryStream = new MemoryStream();
+            
+            // Copy the blob content to the memory stream
+            await response.Value.Content.CopyToAsync(memoryStream);
+            
+            // Reset position to beginning so it can be read
+            memoryStream.Position = 0;
+            
+            return memoryStream;
+        }
+        catch (FileNotFoundException)
+        {
+            // Re-throw FileNotFoundException as is
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to download blob '{blobName}': {ex.Message}", ex);
+        }
     }
 
     public async Task<bool> ExistsAsync(string blobName)
     {
-        var blob = _containerClient.GetBlobClient(blobName);
-        return await blob.ExistsAsync();
+        try
+        {
+            var blob = _containerClient.GetBlobClient(blobName);
+            var response = await blob.ExistsAsync();
+            return response.Value;
+        }
+        catch (Exception)
+        {
+            // If any error occurs, assume blob doesn't exist
+            return false;
+        }
+    }
+
+    public async Task DeleteAsync(string blobName)
+    {
+        try
+        {
+            var blob = _containerClient.GetBlobClient(blobName);
+            await blob.DeleteIfExistsAsync(DeleteSnapshotsOption.IncludeSnapshots);
+        }
+        catch (Exception ex)
+        {
+            // Log the exception if you have logging configured
+            // For now, we'll silently ignore delete errors since DeleteIfExistsAsync should handle most cases
+            // You might want to add logging here: _logger.LogWarning(ex, "Failed to delete blob '{BlobName}'", blobName);
+        }
     }
 }

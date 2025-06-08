@@ -19,14 +19,26 @@ namespace ImageApi.Infrastructure.Data
             modelBuilder.Entity<ImageInfo>(entity =>
             {
                 entity.HasKey(e => e.Id);
-                entity.Property(e => e.Id).HasMaxLength(50);
-                entity.Property(e => e.OriginalFileName).HasMaxLength(255);
-                entity.Property(e => e.BlobName).HasMaxLength(255);
-                entity.Property(e => e.ContentType).HasMaxLength(100);
-                entity.Property(e => e.Size);
-                entity.Property(e => e.OriginalHeight);
-                entity.Property(e => e.OriginalWidth);
-                entity.Property(e => e.UploadedAt);
+                entity.Property(e => e.Id).HasMaxLength(50).IsRequired();
+                
+                entity.Property(e => e.OriginalFileName).HasMaxLength(255).IsRequired();
+                entity.Property(e => e.BlobName).HasMaxLength(255).IsRequired();
+                entity.Property(e => e.ContentType).HasMaxLength(100).IsRequired();
+                
+                entity.Property(e => e.Size).IsRequired();
+                entity.Property(e => e.OriginalHeight).IsRequired();
+                entity.Property(e => e.OriginalWidth).IsRequired();
+                entity.Property(e => e.UploadedAt).IsRequired();
+                
+                // New fields
+                entity.Property(e => e.UpdatedAt).IsRequired(false); // Nullable
+                entity.Property(e => e.FileExtension).HasMaxLength(10).IsRequired();
+                entity.Property(e => e.Description).HasMaxLength(500).IsRequired(false); // Nullable
+                entity.Property(e => e.Metadata).HasMaxLength(1000).IsRequired(false); // Nullable
+                
+                // Set default values
+                entity.Property(e => e.UploadedAt).HasDefaultValueSql("GETUTCDATE()");
+                entity.Property(e => e.FileExtension).HasDefaultValue(".png");
             });
         }
     }

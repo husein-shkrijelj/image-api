@@ -5,5 +5,6 @@
         Task UploadAsync(string blobName, Stream content);
         Task<Stream> DownloadAsync(string blobName);
         Task<bool> ExistsAsync(string blobName);
+        Task DeleteAsync(string blobName);
     }
 }
