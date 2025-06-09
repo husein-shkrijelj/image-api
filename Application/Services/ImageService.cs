@@ -1,79 +1,184 @@
 ﻿using ImageApi.Application.DTOs;
 using ImageApi.Application.Interfaces;
+using ImageApi.Domain.Entities;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Processing;
-using System.IO.Compression;
 using Image = SixLabors.ImageSharp.Image;
 using ImageInfo = ImageApi.Domain.Entities.ImageInfo;
-using Microsoft.Extensions.Caching.Memory;
 
 namespace ImageApi.Application.Services;
 
+/// <summary>
+/// Service for managing image operations including upload, download, resize, and resolution management.
+/// </summary>
 public class ImageService : IImageService
 {
+    #region Constants
+
+    private static class FileExtensions
+    {
+        public const string Jpg = ".jpg";
+        public const string Jpeg = ".jpeg";
+        public const string Png = ".png";
+        public const string Gif = ".gif";
+        public const string Bmp = ".bmp";
+        public const string Webp = ".webp";
+        public const string Tiff = ".tiff";
+        public const string Tif = ".tif";
+    }
+
+    private static class ContentTypes
+    {
+        public const string Jpeg = "image/jpeg";
+        public const string Png = "image/png";
+        public const string Gif = "image/gif";
+        public const string Bmp = "image/bmp";
+        public const string Webp = "image/webp";
+    }
+
+    private static class BlobPaths
+    {
+        public const string OriginalPrefix = "original";
+        public const string ResizedPrefix = "resized";
+        public const string ThumbnailsPrefix = "thumbnails";
+        public const string OriginalSuffix = "_original";
+        public const string ThumbnailSuffix = "_thumb";
+        public const string HeightSuffix = "h";
+        public const string WidthSuffix = "w";
+        public const string PixelSuffix = "px";
+    }
+
+    private static class CacheKeys
+    {
+        public const string ImageInfoPrefix = "image_info_";
+        public const string BlobExistsPrefix = "blob_exists_";
+    }
+
+    private static class ResolutionNames
+    {
+        public const string Original = "original";
+        public const string Thumbnail = "thumbnail";
+        public const string Small = "small";
+        public const string Medium = "medium";
+        public const string Large = "large";
+        public const string XLarge = "xlarge";
+    }
+
+    private static class ErrorMessages
+    {
+        public const string FileEmptyOrNull = "File is empty or null";
+        public const string ImageNotFound = "Image not found";
+        public const string FailedToUpload = "Failed to upload image";
+        public const string FailedToUpdate = "Failed to update image with ID";
+        public const string FailedToDelete = "Failed to delete image with ID";
+        public const string FailedToGenerate = "Failed to generate resized image";
+        public const string FailedToDownload = "Failed to download image";
+        public const string CouldNotRetrieveOriginal = "Could not retrieve original image data";
+        public const string RequestedHeightTooLarge = "Requested height cannot be greater than original image height.";
+    }
+
+    #endregion
+
+    #region Fields
+
     private readonly IAzureBlobStorageService _blobService;
     private readonly IImageRepository _imageRepository;
     private readonly IMemoryCache _memoryCache;
+    private readonly ILogger<ImageService> _logger;
 
     // Predefined resolutions
     private readonly Dictionary<string, (int? width, int? height)> _predefinedResolutions = new()
     {
-        { "thumbnail", (160, null) },
-        { "small", (320, null) },
-        { "medium", (640, null) },
-        { "large", (1024, null) },
-        { "xlarge", (1920, null) }
+        { ResolutionNames.Thumbnail, (160, null) },
+        { ResolutionNames.Small, (320, null) },
+        { ResolutionNames.Medium, (640, null) },
+        { ResolutionNames.Large, (1024, null) },
+        { ResolutionNames.XLarge, (1920, null) }
     };
 
-    public ImageService(IAzureBlobStorageService blobService, IImageRepository imageRepository, IMemoryCache memoryCache)
+    private readonly string[] _supportedExtensions = 
     {
-        _blobService = blobService;
-        _imageRepository = imageRepository;
-        _memoryCache = memoryCache;
+        FileExtensions.Jpg, FileExtensions.Jpeg, FileExtensions.Png, 
+        FileExtensions.Gif, FileExtensions.Bmp, FileExtensions.Webp, 
+        FileExtensions.Tiff, FileExtensions.Tif
+    };
+
+    private readonly int[] _commonSizes = { 320, 640 };
+
+    #endregion
+
+    #region Constructor
+
+    public ImageService(
+        IAzureBlobStorageService blobService, 
+        IImageRepository imageRepository, 
+        IMemoryCache memoryCache,
+        ILogger<ImageService> logger)
+    {
+        _blobService = blobService ?? throw new ArgumentNullException(nameof(blobService));
+        _imageRepository = imageRepository ?? throw new ArgumentNullException(nameof(imageRepository));
+        _memoryCache = memoryCache ?? throw new ArgumentNullException(nameof(memoryCache));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
+
+    #endregion
+
+    #region Public Methods
 
     public async Task<ImageUploadResultDto> UploadImageAsync(IFormFile file)
     {
         try
         {
+            _logger.LogInformation("Starting image upload process for file: {FileName}", file.FileName);
+
             // Validate file
             if (file == null || file.Length == 0)
-                throw new ArgumentException("File is empty or null");
+            {
+                _logger.LogWarning("Upload attempt with empty or null file");
+                throw new ArgumentException(ErrorMessages.FileEmptyOrNull);
+            }
 
             var id = Guid.NewGuid().ToString();
             var fileExtension = Path.GetExtension(file.FileName).ToLowerInvariant();
 
             // Default to .png if no extension or unsupported extension
-            if (string.IsNullOrEmpty(fileExtension) ||
-                !new[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif" }.Contains(fileExtension))
+            if (string.IsNullOrEmpty(fileExtension) || !_supportedExtensions.Contains(fileExtension))
             {
-                fileExtension = ".png";
+                fileExtension = FileExtensions.Png;
+                _logger.LogDebug("Using default PNG extension for file {FileName}", file.FileName);
             }
 
-            // Read the file content into memory first
-            byte[] originalFileBytes;
-            using (var memoryStream = new MemoryStream())
-            {
-                await file.CopyToAsync(memoryStream);
-                originalFileBytes = memoryStream.ToArray();
-            }
-
-            // Get image dimensions
+            // Get image dimensions and upload in one pass
             int imageHeight, imageWidth;
-            using (var imageStream = new MemoryStream(originalFileBytes))
-            using (var image = Image.Load(imageStream))
+            var storageBlobName = $"{BlobPaths.OriginalPrefix}/{id}{BlobPaths.OriginalSuffix}{fileExtension}";
+
+            using (var fileStream = file.OpenReadStream())
             {
-                imageHeight = image.Height;
-                imageWidth = image.Width;
+                // Load image to get dimensions
+                using (var image = Image.Load(fileStream))
+                {
+                    imageHeight = image.Height;
+                    imageWidth = image.Width;
+
+                    // Reset stream position and save as PNG directly to blob storage
+                    fileStream.Position = 0;
+                    using (var image2 = Image.Load(fileStream))
+                    using (var outputStream = new MemoryStream())
+                    {
+                        // Save as PNG for consistency
+                        image2.SaveAsPng(outputStream);
+                        outputStream.Position = 0;
+
+                        // Upload to blob storage
+                        await _blobService.UploadAsync(storageBlobName, outputStream);
+                    }
+                }
             }
 
-            // Store image as-is (no compression)
-            var storageBlobName = $"original/{id}_original.dat";
-            using var originalStream = new MemoryStream(originalFileBytes);
-            await _blobService.UploadAsync(storageBlobName, originalStream);
-
-
+            // Create image info record
             var imageInfo = new ImageInfo
             {
                 Id = id,
@@ -84,98 +189,94 @@ public class ImageService : IImageService
                 OriginalWidth = imageWidth,
                 Size = file.Length,
                 UploadedAt = DateTime.UtcNow,
-                FileExtension = fileExtension,
-                IsCompressed = false,
-                CompressionType = "none"
+                FileExtension = fileExtension
             };
 
+            // Save to database
             await _imageRepository.AddAsync(imageInfo);
 
             // Cache the newly created image info immediately
-            var cacheKey = $"image_info_{id}";
-            var cacheOptions = new MemoryCacheEntryOptions
-            {
-                SlidingExpiration = TimeSpan.FromMinutes(10),
-                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1),
-                Priority = CacheItemPriority.High // New uploads are likely to be accessed soon
-            };
-            _memoryCache.Set(cacheKey, imageInfo, cacheOptions);
+            CacheImageInfo(id, imageInfo, CacheItemPriority.High);
 
-            // Fire-and-forget thumbnail generation for performance
+            _logger.LogInformation("Successfully uploaded image {ImageId} with dimensions {Width}x{Height}",
+                id, imageWidth, imageHeight);
+
+            // Fire-and-forget thumbnail generation for performance (only if image is large enough)
             if (imageHeight >= 160)
             {
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        var thumbnailPath = $"resized/{id}_160h.png";
-                        await GenerateResizedImage(imageInfo, null, 160, thumbnailPath);
-
-                        // Cache that thumbnail exists
-                        _memoryCache.Set($"blob_exists_{thumbnailPath}", true, TimeSpan.FromMinutes(2));
-                        Console.WriteLine($"Background: Pre-generated thumbnail for image {id}");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Background: Failed to pre-generate thumbnail for {id}: {ex.Message}");
-                    }
-                });
+                _ = Task.Run(async () => await GenerateThumbnailInBackgroundOptimized(imageInfo, id, storageBlobName));
             }
 
             return new ImageUploadResultDto { Id = id, Path = storageBlobName };
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Failed to upload image: {ex.Message}", ex);
+            _logger.LogError(ex, "Failed to upload image: {ErrorMessage}", ex.Message);
+            throw new InvalidOperationException($"{ErrorMessages.FailedToUpload}: {ex.Message}", ex);
         }
     }
 
-    // Helper method to get content type from file extension
-    private string GetContentTypeFromExtension(string extension)
+    private async Task GenerateThumbnailInBackgroundOptimized(ImageInfo imageInfo, string id, string originalBlobName)
     {
-        return extension.ToLowerInvariant() switch
+        try
         {
-            ".jpg" or ".jpeg" => "image/jpeg",
-            ".png" => "image/png",
-            ".gif" => "image/gif",
-            ".bmp" => "image/bmp",
-            ".webp" => "image/webp",
-            _ => "image/png"
-        };
+            var thumbnailPath = $"{BlobPaths.ResizedPrefix}/{id}_160{BlobPaths.HeightSuffix}{FileExtensions.Png}";
+
+            // Download the original blob we just uploaded (it's already in PNG format)
+            using var originalStream = await _blobService.DownloadAsync(originalBlobName);
+            using var image = Image.Load(originalStream);
+
+            // Calculate new dimensions maintaining aspect ratio
+            var aspectRatio = (double)image.Width / image.Height;
+            var newWidth = (int)(160 * aspectRatio);
+
+            // Resize and save
+            var resized = image.Clone(x => x.Resize(newWidth, 160));
+            using var thumbnailStream = new MemoryStream();
+            resized.SaveAsPng(thumbnailStream);
+            thumbnailStream.Position = 0;
+
+            await _blobService.UploadAsync(thumbnailPath, thumbnailStream);
+
+            // Cache that thumbnail exists
+            _memoryCache.Set($"{CacheKeys.BlobExistsPrefix}{thumbnailPath}", true, TimeSpan.FromMinutes(2));
+            _logger.LogInformation("Background: Pre-generated thumbnail for image {ImageId}", id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Background: Failed to pre-generate thumbnail for image {ImageId}", id);
+        }
     }
 
     public async Task<IEnumerable<ImageInfo>> GetAllImagesAsync()
     {
+        _logger.LogInformation("Retrieving all images");
         return await _imageRepository.GetAllAsync();
     }
 
-    // Optimized GetImageByIdAsync with caching
     public async Task<ImageInfo?> GetImageByIdAsync(string id)
     {
-        var cacheKey = $"image_info_{id}";
+        var cacheKey = $"{CacheKeys.ImageInfoPrefix}{id}";
 
         // Try to get from cache first
         if (_memoryCache.TryGetValue(cacheKey, out ImageInfo? cachedImageInfo))
         {
-            Console.WriteLine($"Cache hit for image {id}");
+            _logger.LogDebug("Cache hit for image {ImageId}", id);
             return cachedImageInfo;
         }
 
         // Fetch from database
         var imageInfo = await _imageRepository.GetByIdAsync(id);
 
-        // Cache the result with sliding expiration
+        // Cache the result
         if (imageInfo != null)
         {
-            var cacheOptions = new MemoryCacheEntryOptions
-            {
-                SlidingExpiration = TimeSpan.FromMinutes(10), // Reset timer on access
-                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1), // Max 1 hour
-                Priority = CacheItemPriority.Normal
-            };
-
-            _memoryCache.Set(cacheKey, imageInfo, cacheOptions);
-            Console.WriteLine($"Cached image info for {id}");
+            CacheImageInfo(id, imageInfo, CacheItemPriority.Normal);
+            _logger.LogDebug("Cached image info for {ImageId}", id);
+        }
+        else
+        {
+            _logger.LogWarning("Image {ImageId} not found", id);
         }
 
         return imageInfo;
@@ -185,21 +286,26 @@ public class ImageService : IImageService
     {
         try
         {
+            _logger.LogInformation("Downloading original image {ImageId}", id);
+
             var info = await _imageRepository.GetByIdAsync(id);
             if (info == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found for download", id);
                 return null;
-
-            Console.WriteLine($"Downloading image {id} - Original format: {info.FileExtension}");
+            }
 
             if (!await _blobService.ExistsAsync(info.BlobName))
+            {
+                _logger.LogWarning("Blob {BlobName} not found for image {ImageId}", info.BlobName, id);
                 return null;
+            }
 
             var blobStream = await _blobService.DownloadAsync(info.BlobName);
-
-            Console.WriteLine("Returning stored data as-is (original bytes)");
-
             var contentType = !string.IsNullOrWhiteSpace(info.ContentType) ? info.ContentType : GetContentTypeFromExtension(info.FileExtension);
             var fileName = !string.IsNullOrWhiteSpace(info.OriginalFileName) ? info.OriginalFileName : $"image_{id}{info.FileExtension}";
+
+            _logger.LogInformation("Successfully downloaded image {ImageId}", id);
 
             return new ImageDownloadResultDto
             {
@@ -210,71 +316,8 @@ public class ImageService : IImageService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error downloading image {id}: {ex.Message}");
+            _logger.LogError(ex, "Error downloading image {ImageId}: {ErrorMessage}", id, ex.Message);
             return null;
-        }
-    }
-
-    private async Task<Stream> DecompressBinaryFormat(Stream blobStream)
-    {
-        using (blobStream)
-        using (var reader = new BinaryReader(blobStream))
-        {
-            var originalLength = reader.ReadInt32();
-            var compressedLength = reader.ReadInt32();
-            var compressedBytes = reader.ReadBytes(compressedLength);
-
-            using var compressedStream = new MemoryStream(compressedBytes);
-            using var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress);
-
-            var originalBytes = new byte[originalLength];
-            var totalRead = 0;
-            int bytesRead;
-
-            while (totalRead < originalLength && (bytesRead = await gzipStream.ReadAsync(originalBytes, totalRead, originalLength - totalRead)) > 0)
-            {
-                totalRead += bytesRead;
-            }
-
-            Console.WriteLine($"Decompressed {compressedBytes.Length} bytes to {totalRead} bytes");
-            return new MemoryStream(originalBytes);
-        }
-    }
-
-    private async Task<Stream> ConvertFromOptimizedJpeg(Stream jpegStream, string targetExtension)
-    {
-        using (jpegStream)
-        using (var image = Image.Load(jpegStream))
-        {
-            var convertedStream = new MemoryStream();
-
-            switch (targetExtension.ToLowerInvariant())
-            {
-                case ".png":
-                    image.SaveAsPng(convertedStream);
-                    break;
-                case ".jpg":
-                case ".jpeg":
-                    var jpegEncoder = new SixLabors.ImageSharp.Formats.Jpeg.JpegEncoder() { Quality = 95 };
-                    image.SaveAsJpeg(convertedStream, jpegEncoder);
-                    break;
-                case ".gif":
-                    image.SaveAsGif(convertedStream);
-                    break;
-                case ".bmp":
-                    image.SaveAsBmp(convertedStream);
-                    break;
-                case ".webp":
-                    image.SaveAsWebp(convertedStream);
-                    break;
-                default:
-                    image.SaveAsPng(convertedStream);
-                    break;
-            }
-
-            convertedStream.Position = 0;
-            Console.WriteLine($"Converted optimized JPEG to {targetExtension}, size: {convertedStream.Length} bytes");
-            return convertedStream;
         }
     }
 
@@ -282,189 +325,141 @@ public class ImageService : IImageService
     {
         try
         {
+            _logger.LogInformation("Downloading image {ImageId} with resolution {Resolution}", id, resolution);
+
             var info = await _imageRepository.GetByIdAsync(id);
             if (info == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found", id);
                 return null;
+            }
 
             string blobPath;
             string fileName;
 
-            if (resolution.ToLower() == "original")
+            if (resolution.ToLower() == ResolutionNames.Original)
             {
-                // Download original file
                 return await DownloadImageAsync(id);
             }
             else if (_predefinedResolutions.ContainsKey(resolution.ToLower()))
             {
                 var (width, height) = _predefinedResolutions[resolution.ToLower()];
-                var resolutionSuffix = width.HasValue ? $"{width}w" : $"{height}h";
-                blobPath = $"resized/{id}_{resolutionSuffix}.png"; // Resized versions are always PNG
-                fileName = $"{Path.GetFileNameWithoutExtension(info.OriginalFileName ?? id)}_{resolution}.png";
+                var resolutionSuffix = width.HasValue ? $"{width}{BlobPaths.WidthSuffix}" : $"{height}{BlobPaths.HeightSuffix}";
+                blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{resolutionSuffix}{FileExtensions.Png}";
+                fileName = $"{Path.GetFileNameWithoutExtension(info.OriginalFileName ?? id)}_{resolution}{FileExtensions.Png}";
 
                 // Generate if doesn't exist
                 if (!await _blobService.ExistsAsync(blobPath))
                 {
+                    _logger.LogInformation("Generating {Resolution} resolution for image {ImageId}", resolution, id);
                     await GenerateResizedImage(info, width, height, blobPath);
                 }
             }
             else
             {
+                _logger.LogWarning("Invalid resolution {Resolution} requested for image {ImageId}", resolution, id);
                 return null;
             }
 
-            // Check if blob exists before attempting download
             if (!await _blobService.ExistsAsync(blobPath))
+            {
+                _logger.LogWarning("Resized image blob {BlobPath} not found", blobPath);
                 return null;
+            }
 
             var stream = await _blobService.DownloadAsync(blobPath);
             return new ImageDownloadResultDto
             {
                 Stream = stream,
-                ContentType = "image/png", // Resized versions are always PNG
+                ContentType = ContentTypes.Png,
                 FileName = fileName
             };
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error downloading image with resolution. ID: {id}, Resolution: {resolution}, Error: {ex.Message}");
+            _logger.LogError(ex, "Error downloading image with resolution. ID: {ImageId}, Resolution: {Resolution}", id, resolution);
             return null;
         }
     }
 
-    // Optimized resize with parallel common sizes generation
     public async Task<ImageDownloadResultDto?> GetResizedImageAsync(string id, int? width, int? height)
     {
         try
         {
-            var info = await GetImageByIdAsync(id); // Uses cached version
+            _logger.LogInformation("Getting resized image {ImageId} with dimensions {Width}x{Height}", id, width, height);
+
+            var info = await GetImageByIdAsync(id);
             if (info == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found", id);
                 return null;
+            }
 
             if (width.HasValue && width > info.OriginalWidth)
+            {
+                _logger.LogWarning("Requested width {Width} exceeds original width {OriginalWidth} for image {ImageId}", 
+                    width, info.OriginalWidth, id);
                 return null;
+            }
+
             if (height.HasValue && height > info.OriginalHeight)
+            {
+                _logger.LogWarning("Requested height {Height} exceeds original height {OriginalHeight} for image {ImageId}", 
+                    height, info.OriginalHeight, id);
                 return null;
+            }
 
-            var dimensionSuffix = width.HasValue ? $"{width}w" : $"{height}h";
-            var blobPath = $"resized/{id}_{dimensionSuffix}.png";
-            var fileName = $"{Path.GetFileNameWithoutExtension(info.OriginalFileName ?? id)}_{dimensionSuffix}.png";
+            var dimensionSuffix = width.HasValue ? $"{width}{BlobPaths.WidthSuffix}" : $"{height}{BlobPaths.HeightSuffix}";
+            var blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{dimensionSuffix}{FileExtensions.Png}";
+            var fileName = $"{Path.GetFileNameWithoutExtension(info.OriginalFileName ?? id)}_{dimensionSuffix}{FileExtensions.Png}";
 
-            // Check if exists first (fast check)
             if (!await _blobService.ExistsAsync(blobPath))
             {
+                _logger.LogInformation("Generating resized image for {ImageId} with dimensions {Width}x{Height}", id, width, height);
                 await GenerateResizedImage(info, width, height, blobPath);
 
                 // Opportunistically generate common sizes in background
-                if (height == 160) // If thumbnail was requested, generate other common sizes
+                if (height == 160)
                 {
-                    _ = Task.Run(async () =>
-                    {
-                        await GenerateCommonSizesInBackground(info, id);
-                    });
+                    _ = Task.Run(async () => await GenerateCommonSizesInBackground(info, id));
                 }
             }
 
             if (!await _blobService.ExistsAsync(blobPath))
+            {
+                _logger.LogError("Failed to generate or find resized image blob {BlobPath}", blobPath);
                 return null;
+            }
 
             var stream = await _blobService.DownloadAsync(blobPath);
+            _logger.LogInformation("Successfully retrieved resized image {ImageId}", id);
+
             return new ImageDownloadResultDto
             {
                 Stream = stream,
-                ContentType = "image/png",
+                ContentType = ContentTypes.Png,
                 FileName = fileName
             };
         }
         catch (Exception ex)
         {
-            // Log the exception if you have logging configured
-            // _logger.LogError(ex, "Failed to get resized image. ID: {ImageId}, Width: {Width}, Height: {Height}", id, width, height);
+            _logger.LogError(ex, "Failed to get resized image. ID: {ImageId}, Width: {Width}, Height: {Height}", id, width, height);
             return null;
         }
-    }
-
-    // Background generation of common sizes
-    private async Task GenerateCommonSizesInBackground(ImageInfo info, string id)
-    {
-        var commonSizes = new[] { 320, 640 }; // small and medium sizes
-
-        foreach (var size in commonSizes)
-        {
-            if (size < info.OriginalHeight) // Only generate if original is larger
-            {
-                try
-                {
-                    var sizePath = $"resized/{id}_{size}h.png";
-
-                    // Check if it already exists (with cache)
-                    if (!await ExistsWithCacheAsync(sizePath))
-                    {
-                        await GenerateResizedImage(info, null, size, sizePath);
-
-                        // Cache that this size now exists
-                        var cacheOptions = new MemoryCacheEntryOptions
-                        {
-                            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2),
-                            Priority = CacheItemPriority.Low
-                        };
-                        _memoryCache.Set($"blob_exists_{sizePath}", true, cacheOptions);
-
-                        Console.WriteLine($"Background: Generated {size}px version for {id}");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Background: {size}px version already exists for {id}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Background: Failed to generate {size}px for {id}: {ex.Message}");
-                    // Continue with next size even if one fails
-                }
-            }
-            else
-            {
-                Console.WriteLine($"Background: Skipping {size}px for {id} - original height ({info.OriginalHeight}px) is too small");
-            }
-        }
-    }
-
-    // Cache blob existence checks for better performance
-    private async Task<bool> ExistsWithCacheAsync(string blobPath)
-    {
-        var cacheKey = $"blob_exists_{blobPath}";
-
-        // Try to get from cache first
-        if (_memoryCache.TryGetValue(cacheKey, out bool cachedExists))
-        {
-            Console.WriteLine($"Cache hit for blob existence: {blobPath} = {cachedExists}");
-            return cachedExists;
-        }
-
-        // Not in cache, check actual blob storage
-        Console.WriteLine($"Cache miss for blob existence: {blobPath} - checking storage");
-        bool actualExists = await _blobService.ExistsAsync(blobPath);
-
-        // Cache the result with shorter expiration (blobs can be created/deleted frequently)
-        var cacheOptions = new MemoryCacheEntryOptions
-        {
-            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2), // Short expiration for blob existence
-            Priority = CacheItemPriority.Low // Lower priority than image info
-        };
-
-        _memoryCache.Set(cacheKey, actualExists, cacheOptions);
-        Console.WriteLine($"Cached blob existence: {blobPath} = {actualExists}");
-
-        return actualExists;
     }
 
     public async Task<IEnumerable<string>?> GetAvailableResolutionsAsync(string id)
     {
+        _logger.LogInformation("Getting available resolutions for image {ImageId}", id);
+
         var info = await _imageRepository.GetByIdAsync(id);
         if (info == null)
+        {
+            _logger.LogWarning("Image {ImageId} not found", id);
             return null;
+        }
 
-        var availableResolutions = new List<string> { "original" };
+        var availableResolutions = new List<string> { ResolutionNames.Original };
 
         // Check which predefined resolutions are available or can be generated
         foreach (var resolution in _predefinedResolutions)
@@ -481,6 +476,7 @@ public class ImageService : IImageService
                 availableResolutions.Add(resolution.Key);
         }
 
+        _logger.LogInformation("Found {Count} available resolutions for image {ImageId}", availableResolutions.Count, id);
         return availableResolutions;
     }
 
@@ -488,9 +484,14 @@ public class ImageService : IImageService
     {
         try
         {
+            _logger.LogInformation("Updating image {ImageId}", id);
+
             var existingInfo = await _imageRepository.GetByIdAsync(id);
             if (existingInfo == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found for update", id);
                 return null;
+            }
 
             // Delete old blobs
             await DeleteImageBlobsAsync(id);
@@ -502,7 +503,7 @@ public class ImageService : IImageService
             using var stream = file.OpenReadStream();
             using var image = Image.Load(stream);
 
-            var blobName = $"original/{id}.png";
+            var blobName = $"{BlobPaths.OriginalPrefix}/{id}{FileExtensions.Png}";
             stream.Position = 0;
             await _blobService.UploadAsync(blobName, stream);
 
@@ -516,87 +517,15 @@ public class ImageService : IImageService
             await _imageRepository.UpdateAsync(existingInfo);
 
             // Update cache with new image info
-            var cacheKey = $"image_info_{id}";
-            var cacheOptions = new MemoryCacheEntryOptions
-            {
-                SlidingExpiration = TimeSpan.FromMinutes(10),
-                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1),
-                Priority = CacheItemPriority.High
-            };
-            _memoryCache.Set(cacheKey, existingInfo, cacheOptions);
+            CacheImageInfo(id, existingInfo, CacheItemPriority.High);
 
+            _logger.LogInformation("Successfully updated image {ImageId}", id);
             return new ImageUploadResultDto { Id = id, Path = blobName };
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Failed to update image with ID {id}: {ex.Message}", ex);
-        }
-    }
-
-    private void ClearImageCacheEntries(string id)
-    {
-        try
-        {
-            // Clear image info cache
-            var imageInfoCacheKey = $"image_info_{id}";
-            _memoryCache.Remove(imageInfoCacheKey);
-            Console.WriteLine($"Cleared image info cache for {id}");
-
-            // Clear blob existence cache for original image
-            // Note: We can't easily get the original blob name here since we might be deleting
-            // So we'll clear common patterns
-            var originalBlobPatterns = new[]
-            {
-            $"blob_exists_original/{id}_original.dat",
-            $"blob_exists_original/{id}.png",
-            $"blob_exists_original/{id}.jpg",
-            $"blob_exists_original/{id}.jpeg"
-        };
-
-            foreach (var pattern in originalBlobPatterns)
-            {
-                _memoryCache.Remove(pattern);
-            }
-
-            // Clear blob existence cache for all possible resized versions
-            var blobCacheKeysToRemove = new List<string>();
-
-            // Add predefined resolution blob cache keys
-            foreach (var resolution in _predefinedResolutions)
-            {
-                var (width, height) = resolution.Value;
-                var dimensionSuffix = width.HasValue ? $"{width}w" : $"{height}h";
-                var blobPath = $"resized/{id}_{dimensionSuffix}.png";
-                blobCacheKeysToRemove.Add($"blob_exists_{blobPath}");
-            }
-
-            // Add legacy thumbnail cache key
-            blobCacheKeysToRemove.Add($"blob_exists_thumbnails/{id}_thumb.png");
-
-            // Add common custom sizes that might be cached
-            var commonSizes = new[] { 160, 320, 640, 800, 1024, 1200, 1600, 1920 };
-            foreach (var size in commonSizes)
-            {
-                // Height-based resizes
-                blobCacheKeysToRemove.Add($"blob_exists_resized/{id}_{size}h.png");
-                // Width-based resizes  
-                blobCacheKeysToRemove.Add($"blob_exists_resized/{id}_{size}w.png");
-                // Legacy format
-                blobCacheKeysToRemove.Add($"blob_exists_resized/{id}_{size}px.png");
-            }
-
-            // Remove all blob existence cache entries
-            foreach (var cacheKey in blobCacheKeysToRemove)
-            {
-                _memoryCache.Remove(cacheKey);
-            }
-
-            Console.WriteLine($"Cleared {blobCacheKeysToRemove.Count + originalBlobPatterns.Length + 1} cache entries for image {id}");
-        }
-        catch (Exception ex)
-        {
-            // Don't fail the delete operation if cache clearing fails
-            Console.WriteLine($"Warning: Failed to clear cache entries for {id}: {ex.Message}");
+            _logger.LogError(ex, "Failed to update image {ImageId}: {ErrorMessage}", id, ex.Message);
+            throw new InvalidOperationException($"{ErrorMessages.FailedToUpdate} {id}: {ex.Message}", ex);
         }
     }
 
@@ -604,9 +533,14 @@ public class ImageService : IImageService
     {
         try
         {
+            _logger.LogInformation("Deleting image {ImageId}", id);
+
             var info = await _imageRepository.GetByIdAsync(id);
             if (info == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found for deletion", id);
                 return false;
+            }
 
             // Delete all associated blobs
             await DeleteImageBlobsAsync(id);
@@ -617,12 +551,12 @@ public class ImageService : IImageService
             // Clear cache entries for this image
             ClearImageCacheEntries(id);
 
+            _logger.LogInformation("Successfully deleted image {ImageId}", id);
             return true;
         }
         catch (Exception ex)
         {
-            // Log the exception if you have logging configured
-            // _logger.LogError(ex, "Failed to delete image with ID: {ImageId}", id);
+            _logger.LogError(ex, "Failed to delete image {ImageId}: {ErrorMessage}", id, ex.Message);
             return false;
         }
     }
@@ -631,9 +565,14 @@ public class ImageService : IImageService
     {
         try
         {
+            _logger.LogInformation("Generating predefined resolutions for image {ImageId}", id);
+
             var info = await _imageRepository.GetByIdAsync(id);
             if (info == null)
+            {
+                _logger.LogWarning("Image {ImageId} not found", id);
                 return null;
+            }
 
             var result = new ResolutionGenerationResultDto { ImageId = id };
 
@@ -651,17 +590,21 @@ public class ImageService : IImageService
 
                 if (!canGenerate)
                 {
-                    result.SkippedResolutions.Add($"{resolutionName} (exceeds original dimensions)");
+                    var skipMessage = $"{resolutionName} (exceeds original dimensions)";
+                    result.SkippedResolutions.Add(skipMessage);
+                    _logger.LogInformation("Skipped resolution {Resolution} for image {ImageId}: exceeds original dimensions", resolutionName, id);
                     continue;
                 }
 
-                var dimensionSuffix = width.HasValue ? $"{width}w" : $"{height}h";
-                var blobPath = $"resized/{id}_{dimensionSuffix}.png";
+                var dimensionSuffix = width.HasValue ? $"{width}{BlobPaths.WidthSuffix}" : $"{height}{BlobPaths.HeightSuffix}";
+                var blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{dimensionSuffix}{FileExtensions.Png}";
 
                 // Skip if already exists
                 if (await _blobService.ExistsAsync(blobPath))
                 {
-                    result.SkippedResolutions.Add($"{resolutionName} (already exists)");
+                    var skipMessage = $"{resolutionName} (already exists)";
+                    result.SkippedResolutions.Add(skipMessage);
+                    _logger.LogInformation("Skipped resolution {Resolution} for image {ImageId}: already exists", resolutionName, id);
                     continue;
                 }
 
@@ -670,28 +613,35 @@ public class ImageService : IImageService
                 {
                     await GenerateResizedImage(info, width, height, blobPath);
                     result.GeneratedResolutions.Add(resolutionName);
+                    _logger.LogInformation("Generated resolution {Resolution} for image {ImageId}", resolutionName, id);
                 }
                 catch (Exception ex)
                 {
-                    result.SkippedResolutions.Add($"{resolutionName} (error: {ex.Message})");
+                    var errorMessage = $"{resolutionName} (error: {ex.Message})";
+                    result.SkippedResolutions.Add(errorMessage);
+                    _logger.LogError(ex, "Failed to generate resolution {Resolution} for image {ImageId}", resolutionName, id);
                 }
             }
+
+            _logger.LogInformation("Completed resolution generation for image {ImageId}. Generated: {GeneratedCount}, Skipped: {SkippedCount}", 
+                id, result.GeneratedResolutions.Count, result.SkippedResolutions.Count);
 
             return result;
         }
         catch (Exception ex)
         {
-            // Log the exception if you have logging configured
-            // _logger.LogError(ex, "Failed to generate predefined resolutions for image ID: {ImageId}", id);
+            _logger.LogError(ex, "Failed to generate predefined resolutions for image {ImageId}", id);
             return null;
         }
     }
 
-    // Legacy method for backward compatibility
+    [Obsolete("Use GetResizedImageAsync instead. This method will be removed in a future version.")]
     public async Task<string?> GetResizedImagePathAsync(string imageId, int height)
     {
         try
         {
+            _logger.LogWarning("Using deprecated method GetResizedImagePathAsync for image {ImageId}", imageId);
+
             var info = await _imageRepository.GetByIdAsync(imageId);
             if (info == null)
                 return null;
@@ -701,12 +651,12 @@ public class ImageService : IImageService
 
             if (height == 160)
             {
-                var thumbnailPath = $"thumbnails/{imageId}_thumb.png";
+                var thumbnailPath = $"{BlobPaths.ThumbnailsPrefix}/{imageId}{BlobPaths.ThumbnailSuffix}{FileExtensions.Png}";
                 if (await _blobService.ExistsAsync(thumbnailPath))
                     return thumbnailPath;
             }
 
-            var variationName = $"resized/{imageId}_{height}px.png";
+            var variationName = $"{BlobPaths.ResizedPrefix}/{imageId}_{height}{BlobPaths.PixelSuffix}{FileExtensions.Png}";
             if (await _blobService.ExistsAsync(variationName))
                 return variationName;
 
@@ -723,21 +673,269 @@ public class ImageService : IImageService
         }
         catch (Exception ex)
         {
-            // Log the exception if you have logging configured
-            // _logger.LogError(ex, "Failed to get resized image path for image ID: {ImageId}, Height: {Height}", imageId, height);
+            _logger.LogError(ex, "Failed to get resized image path for image {ImageId}, Height: {Height}", imageId, height);
             return null;
         }
     }
 
-    // Private helper methods
+    [Obsolete("Use GetResizedImageAsync instead. This method will be removed in a future version.")]
+    public async Task<ResizedImageUrlResultDto?> GetResizedImageUrlAsync(string id, int height)
+    {
+        try
+        {
+            _logger.LogWarning("Using deprecated method GetResizedImageUrlAsync for image {ImageId}", id);
+
+            var image = await _imageRepository.GetByIdAsync(id);
+            if (image == null)
+                return null;
+
+            if (height > image.OriginalHeight)
+            {
+                return new ResizedImageUrlResultDto
+                {
+                    Error = ErrorMessages.RequestedHeightTooLarge
+                };
+            }
+
+            // Generate the resized image if it doesn't exist
+            var dimensionSuffix = $"{height}{BlobPaths.HeightSuffix}";
+            var blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{dimensionSuffix}{FileExtensions.Png}";
+
+            if (!await _blobService.ExistsAsync(blobPath))
+            {
+                try
+                {
+                    await GenerateResizedImage(image, null, height, blobPath);
+                }
+                catch (Exception ex)
+                {
+                    return new ResizedImageUrlResultDto
+                    {
+                        Error = $"{ErrorMessages.FailedToGenerate}: {ex.Message}"
+                    };
+                }
+            }
+
+            // Return URL information
+            var downloadUrl = $"/api/images/{id}/resize?height={height}";
+            return new ResizedImageUrlResultDto
+            {
+                ImageId = id,
+                Height = height,
+                Url = downloadUrl,
+                Path = blobPath,
+                Error = null
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in GetResizedImageUrlAsync for image {ImageId}", id);
+            return new ResizedImageUrlResultDto
+            {
+                Error = $"An error occurred: {ex.Message}"
+            };
+        }
+    }
+
+    // Public method for testing purposes
+    public async Task GenerateResizedImagePublic(ImageInfo info, int? width, int? height, string blobPath)
+    {
+        await GenerateResizedImage(info, width, height, blobPath);
+    }
+
+    #endregion
+
+    #region Private Helper Methods
+
+    private string GetContentTypeFromExtension(string extension)
+    {
+        return extension.ToLowerInvariant() switch
+        {
+            FileExtensions.Jpg or FileExtensions.Jpeg => ContentTypes.Jpeg,
+            FileExtensions.Png => ContentTypes.Png,
+            FileExtensions.Gif => ContentTypes.Gif,
+            FileExtensions.Bmp => ContentTypes.Bmp,
+            FileExtensions.Webp => ContentTypes.Webp,
+            _ => ContentTypes.Png
+        };
+    }
+
+    private void CacheImageInfo(string id, ImageInfo imageInfo, CacheItemPriority priority)
+    {
+        var cacheKey = $"{CacheKeys.ImageInfoPrefix}{id}";
+        var cacheOptions = new MemoryCacheEntryOptions
+        {
+            SlidingExpiration = TimeSpan.FromMinutes(10),
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(1),
+            Priority = priority
+        };
+        _memoryCache.Set(cacheKey, imageInfo, cacheOptions);
+    }
+
+    private async Task GenerateThumbnailInBackground(ImageInfo imageInfo, string id)
+    {
+        try
+        {
+            var thumbnailPath = $"{BlobPaths.ResizedPrefix}/{id}_160{BlobPaths.HeightSuffix}{FileExtensions.Png}";
+            await GenerateResizedImage(imageInfo, null, 160, thumbnailPath);
+
+            // Cache that thumbnail exists
+            _memoryCache.Set($"{CacheKeys.BlobExistsPrefix}{thumbnailPath}", true, TimeSpan.FromMinutes(2));
+            _logger.LogInformation("Background: Pre-generated thumbnail for image {ImageId}", id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Background: Failed to pre-generate thumbnail for image {ImageId}", id);
+        }
+    }
+
+    private async Task GenerateCommonSizesInBackground(ImageInfo info, string id)
+    {
+        foreach (var size in _commonSizes)
+        {
+            if (size < info.OriginalHeight)
+            {
+                try
+                {
+                    var sizePath = $"{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.HeightSuffix}{FileExtensions.Png}";
+
+                    if (!await ExistsWithCacheAsync(sizePath))
+                    {
+                        await GenerateResizedImage(info, null, size, sizePath);
+
+                        var cacheOptions = new MemoryCacheEntryOptions
+                        {
+                            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2),
+                            Priority = CacheItemPriority.Low
+                        };
+                        _memoryCache.Set($"{CacheKeys.BlobExistsPrefix}{sizePath}", true, cacheOptions);
+
+                        _logger.LogInformation("Background: Generated {Size}px version for image {ImageId}", size, id);
+                    }
+                    else
+                    {
+                        _logger.LogDebug("Background: {Size}px version already exists for image {ImageId}", size, id);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Background: Failed to generate {Size}px for image {ImageId}", size, id);
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Background: Skipping {Size}px for image {ImageId} - original height ({OriginalHeight}px) is too small", 
+                    size, id, info.OriginalHeight);
+            }
+        }
+    }
+
+    private async Task<bool> ExistsWithCacheAsync(string blobPath)
+    {
+        var cacheKey = $"{CacheKeys.BlobExistsPrefix}{blobPath}";
+
+        // Try to get from cache first
+        if (_memoryCache.TryGetValue(cacheKey, out bool cachedExists))
+        {
+            _logger.LogDebug("Cache hit for blob existence: {BlobPath} = {Exists}", blobPath, cachedExists);
+            return cachedExists;
+        }
+
+        // Not in cache, check actual blob storage
+        _logger.LogDebug("Cache miss for blob existence: {BlobPath} - checking storage", blobPath);
+        bool actualExists = await _blobService.ExistsAsync(blobPath);
+
+        // Cache the result with shorter expiration
+        var cacheOptions = new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(2),
+            Priority = CacheItemPriority.Low
+        };
+
+        _memoryCache.Set(cacheKey, actualExists, cacheOptions);
+        _logger.LogDebug("Cached blob existence: {BlobPath} = {Exists}", blobPath, actualExists);
+
+        return actualExists;
+    }
+
+    private void ClearImageCacheEntries(string id)
+    {
+        try
+        {
+            // Clear image info cache
+            var imageInfoCacheKey = $"{CacheKeys.ImageInfoPrefix}{id}";
+            _memoryCache.Remove(imageInfoCacheKey);
+            _logger.LogDebug("Cleared image info cache for {ImageId}", id);
+
+            // Clear blob existence cache for original image patterns
+            var originalBlobPatterns = new[]
+            {
+                $"{CacheKeys.BlobExistsPrefix}{BlobPaths.OriginalPrefix}/{id}{BlobPaths.OriginalSuffix}{FileExtensions.Png}",
+                $"{CacheKeys.BlobExistsPrefix}{BlobPaths.OriginalPrefix}/{id}{FileExtensions.Png}",
+                $"{CacheKeys.BlobExistsPrefix}{BlobPaths.OriginalPrefix}/{id}{FileExtensions.Jpg}",
+                $"{CacheKeys.BlobExistsPrefix}{BlobPaths.OriginalPrefix}/{id}{FileExtensions.Jpeg}"
+            };
+
+            foreach (var pattern in originalBlobPatterns)
+            {
+                _memoryCache.Remove(pattern);
+            }
+
+            // Clear blob existence cache for all possible resized versions
+            var blobCacheKeysToRemove = new List<string>();
+
+            // Add predefined resolution blob cache keys
+            foreach (var resolution in _predefinedResolutions)
+            {
+                var (width, height) = resolution.Value;
+                var dimensionSuffix = width.HasValue ? $"{width}{BlobPaths.WidthSuffix}" : $"{height}{BlobPaths.HeightSuffix}";
+                var blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{dimensionSuffix}{FileExtensions.Png}";
+                blobCacheKeysToRemove.Add($"{CacheKeys.BlobExistsPrefix}{blobPath}");
+            }
+
+            // Add legacy thumbnail cache key
+            blobCacheKeysToRemove.Add($"{CacheKeys.BlobExistsPrefix}{BlobPaths.ThumbnailsPrefix}/{id}{BlobPaths.ThumbnailSuffix}{FileExtensions.Png}");
+
+            // Add common custom sizes that might be cached
+            var commonSizes = new[] { 160, 320, 640, 800, 1024, 1200, 1600, 1920 };
+            foreach (var size in commonSizes)
+            {
+                // Height-based resizes
+                blobCacheKeysToRemove.Add($"{CacheKeys.BlobExistsPrefix}{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.HeightSuffix}{FileExtensions.Png}");
+                // Width-based resizes  
+                blobCacheKeysToRemove.Add($"{CacheKeys.BlobExistsPrefix}{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.WidthSuffix}{FileExtensions.Png}");
+                // Legacy format
+                blobCacheKeysToRemove.Add($"{CacheKeys.BlobExistsPrefix}{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.PixelSuffix}{FileExtensions.Png}");
+            }
+
+            // Remove all blob existence cache entries
+            foreach (var cacheKey in blobCacheKeysToRemove)
+            {
+                _memoryCache.Remove(cacheKey);
+            }
+
+            _logger.LogDebug("Cleared {CacheEntryCount} cache entries for image {ImageId}", 
+                blobCacheKeysToRemove.Count + originalBlobPatterns.Length + 1, id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to clear cache entries for image {ImageId}", id);
+        }
+    }
+
     private async Task GenerateResizedImage(ImageInfo info, int? width, int? height, string blobPath)
     {
         try
         {
+            _logger.LogDebug("Generating resized image for {ImageId} with dimensions {Width}x{Height}", info.Id, width, height);
+
             // First, get the original image data
             var originalImageStream = await DownloadImageAsync(info.Id);
             if (originalImageStream == null)
-                throw new InvalidOperationException("Could not retrieve original image data");
+            {
+                _logger.LogError("Could not retrieve original image data for {ImageId}", info.Id);
+                throw new InvalidOperationException(ErrorMessages.CouldNotRetrieveOriginal);
+            }
 
             // Load image from the original data
             using (originalImageStream.Stream)
@@ -748,21 +946,18 @@ public class ImageService : IImageService
 
                 var resized = image.Clone(x => x.Resize(newWidth, newHeight));
                 using var ms = new MemoryStream();
-                resized.SaveAsPng(ms); // Save resized versions as PNG for consistency
+                resized.SaveAsPng(ms);
                 ms.Position = 0;
 
                 await _blobService.UploadAsync(blobPath, ms);
+                _logger.LogDebug("Successfully generated resized image at {BlobPath}", blobPath);
             }
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Failed to generate resized image: {ex.Message}", ex);
+            _logger.LogError(ex, "Failed to generate resized image for {ImageId}", info.Id);
+            throw new InvalidOperationException($"{ErrorMessages.FailedToGenerate}: {ex.Message}", ex);
         }
-    }
-
-    public async Task GenerateResizedImagePublic(ImageInfo info, int? width, int? height, string blobPath)
-    {
-        await GenerateResizedImage(info, width, height, blobPath);
     }
 
     private (int width, int height) CalculateNewDimensions(int originalWidth, int originalHeight, int? targetWidth, int? targetHeight)
@@ -791,6 +986,8 @@ public class ImageService : IImageService
 
     private async Task DeleteImageBlobsAsync(string id)
     {
+        _logger.LogDebug("Deleting all blobs for image {ImageId}", id);
+
         // Delete original image
         var info = await _imageRepository.GetByIdAsync(id);
         if (info != null)
@@ -798,10 +995,11 @@ public class ImageService : IImageService
             try
             {
                 await _blobService.DeleteAsync(info.BlobName);
+                _logger.LogDebug("Deleted original blob {BlobName} for image {ImageId}", info.BlobName, id);
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore errors for non-existent blobs
+                _logger.LogWarning(ex, "Failed to delete original blob {BlobName} for image {ImageId}", info.BlobName, id);
             }
         }
 
@@ -812,78 +1010,40 @@ public class ImageService : IImageService
         foreach (var resolution in _predefinedResolutions)
         {
             var (width, height) = resolution.Value;
-            var dimensionSuffix = width.HasValue ? $"{width}w" : $"{height}h";
-            var blobPath = $"resized/{id}_{dimensionSuffix}.png";
+            var dimensionSuffix = width.HasValue ? $"{width}{BlobPaths.WidthSuffix}" : $"{height}{BlobPaths.HeightSuffix}";
+            var blobPath = $"{BlobPaths.ResizedPrefix}/{id}_{dimensionSuffix}{FileExtensions.Png}";
             blobsToDelete.Add(blobPath);
         }
 
         // Add legacy thumbnail path
-        blobsToDelete.Add($"thumbnails/{id}_thumb.png");
+        blobsToDelete.Add($"{BlobPaths.ThumbnailsPrefix}/{id}{BlobPaths.ThumbnailSuffix}{FileExtensions.Png}");
+
+        // Add common custom sizes
+        var commonSizes = new[] { 160, 320, 640, 800, 1024, 1200, 1600, 1920 };
+        foreach (var size in commonSizes)
+        {
+            blobsToDelete.Add($"{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.HeightSuffix}{FileExtensions.Png}");
+            blobsToDelete.Add($"{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.WidthSuffix}{FileExtensions.Png}");
+            blobsToDelete.Add($"{BlobPaths.ResizedPrefix}/{id}_{size}{BlobPaths.PixelSuffix}{FileExtensions.Png}");
+        }
 
         // Delete all blobs (ignore errors for non-existent blobs)
+        var deletedCount = 0;
         foreach (var blobPath in blobsToDelete)
         {
             try
             {
                 await _blobService.DeleteAsync(blobPath);
+                deletedCount++;
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore errors for non-existent blobs
+                _logger.LogDebug(ex, "Failed to delete blob {BlobPath} (may not exist)", blobPath);
             }
         }
+
+        _logger.LogDebug("Deleted {DeletedCount} blobs for image {ImageId}", deletedCount, id);
     }
 
-    public async Task<ResizedImageUrlResultDto?> GetResizedImageUrlAsync(string id, int height)
-    {
-        try
-        {
-            var image = await _imageRepository.GetByIdAsync(id);
-            if (image == null)
-                return null;
-
-            if (height > image.OriginalHeight)
-                return new ResizedImageUrlResultDto
-                {
-                    Error = "Requested height cannot be greater than original image height."
-                };
-
-            // Generate the resized image if it doesn't exist
-            var dimensionSuffix = $"{height}h";
-            var blobPath = $"resized/{id}_{dimensionSuffix}.png";
-
-            if (!await _blobService.ExistsAsync(blobPath))
-            {
-                try
-                {
-                    await GenerateResizedImage(image, null, height, blobPath);
-                }
-                catch (Exception ex)
-                {
-                    return new ResizedImageUrlResultDto
-                    {
-                        Error = $"Failed to generate resized image: {ex.Message}"
-                    };
-                }
-            }
-
-            // Return URL information
-            var downloadUrl = $"/api/images/{id}/resize?height={height}";
-            return new ResizedImageUrlResultDto
-            {
-                ImageId = id,
-                Height = height,
-                Url = downloadUrl,
-                Path = blobPath,
-                Error = null
-            };
-        }
-        catch (Exception ex)
-        {
-            return new ResizedImageUrlResultDto
-            {
-                Error = $"An error occurred: {ex.Message}"
-            };
-        }
-    }
+    #endregion
 }
