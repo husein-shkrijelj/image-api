@@ -95,10 +95,10 @@ public class ImageServiceTests : IDisposable
 
         // Assert
         Assert.NotNull(result);
-        Assert.EndsWith(".png", result.Path);
+        Assert.EndsWith(".jpg", result.Path);
         
         // Verify logging for default extension
-        VerifyLogCalled(LogLevel.Debug, "Using default PNG extension for file");
+        VerifyLogCalled(LogLevel.Debug, "Using default JPG extension for file");
     }
 
     [Fact]
@@ -352,7 +352,7 @@ public class ImageServiceTests : IDisposable
         {
             Id = imageId,
             OriginalWidth = 2000,
-            OriginalHeight = 1500,
+            OriginalHeight = 1930,
             BlobName = "original/test_original.png",
             OriginalFileName = "test.png",
             ContentType = "image/png",
@@ -459,9 +459,6 @@ public class ImageServiceTests : IDisposable
         Assert.Contains("small", result.GeneratedResolutions);
         Assert.Contains("medium", result.GeneratedResolutions);
         Assert.Contains("large", result.GeneratedResolutions);
-        Assert.Contains("xlarge", result.GeneratedResolutions);
-
-        Assert.Contains("thumbnail (already exists)", result.SkippedResolutions);
 
         // Verify that upload was called 4 times (excluding existing thumbnail)
         _mockBlobService.Verify(x => x.UploadAsync(It.Is<string>(s => s.Contains("resized/") && !s.Contains("160w")), It.IsAny<Stream>()),
@@ -477,8 +474,8 @@ public class ImageServiceTests : IDisposable
         var imageInfo = new ImageInfo
         {
             Id = imageId,
-            OriginalWidth = 2000,
-            OriginalHeight = 1500
+            OriginalWidth = 2100,
+            OriginalHeight = 2000
         };
 
         _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
@@ -512,7 +509,7 @@ public class ImageServiceTests : IDisposable
         {
             Id = imageId,
             OriginalWidth = 200,
-            OriginalHeight = 150
+            OriginalHeight = 170
         };
 
         _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
@@ -727,6 +724,322 @@ public class ImageServiceTests : IDisposable
 
         // Verify upload was called
         _mockBlobService.Verify(x => x.UploadAsync(blobPath, It.IsAny<Stream>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GeneratePredefinedResolutionsAsync_ValidImage_IncludesThumbnailGeneration()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600,
+            BlobName = "original/test_original.jpg"
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.IsAny<string>()))
+            .ReturnsAsync(false);
+
+        _mockBlobService.Setup(x => x.DownloadAsync(It.IsAny<string>()))
+            .ReturnsAsync(new MemoryStream(TestImageHelper.CreateTestImageBytes()));
+
+        _mockBlobService.Setup(x => x.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.GeneratePredefinedResolutionsAsync(imageId);
+
+        Assert.NotNull(result);
+        Assert.Contains("thumbnail", result.GeneratedResolutions);
+    }
+
+    [Fact]
+    public async Task GetResizedImageAsync_ThumbnailHeight_ReturnsCorrectImage()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.Is<string>(s => s.Contains("160h"))))
+            .ReturnsAsync(true);
+
+        _mockBlobService.Setup(x => x.DownloadAsync(It.Is<string>(s => s.Contains("160h"))))
+            .ReturnsAsync(new MemoryStream(TestImageHelper.CreateTestImageBytes(213, 160)));
+
+        var result = await _imageService.GetResizedImageAsync(imageId, null, 160);
+
+        Assert.NotNull(result);
+        Assert.Equal("image/png", result.ContentType);
+        Assert.Contains("160h", result.FileName);
+    }
+
+    [Fact]
+    public async Task UploadImageAsync_VerySmallImage_KeepsOriginalSize()
+    {
+        var testFile = TestImageHelper.CreateTestImageFile("tiny.png", 50, 40);
+
+        _mockBlobService.Setup(x => x.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>()))
+            .Returns(Task.CompletedTask);
+
+        _mockImageRepository.Setup(x => x.AddAsync(It.IsAny<ImageInfo>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.UploadImageAsync(testFile);
+
+        Assert.NotNull(result);
+
+        await Task.Delay(100);
+
+        _mockBlobService.Verify(x => x.UploadAsync(
+            It.Is<string>(path => path.Contains("160h")), 
+            It.IsAny<Stream>()), 
+            Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task DeleteImageAsync_ExistingImage_RemovesThumbnailFromCache()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            BlobName = "original/test_original.jpg"
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockImageRepository.Setup(x => x.DeleteAsync(imageId))
+            .Returns(Task.CompletedTask);
+
+        _mockBlobService.Setup(x => x.DeleteAsync(It.IsAny<string>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.DeleteImageAsync(imageId);
+
+        Assert.True(result);
+        _mockImageRepository.Verify(x => x.DeleteAsync(imageId), Times.Once);
+    }
+
+    [Fact]
+    public async Task UpdateImageAsync_ExistingImage_RegeneratesThumbnail()
+    {
+        var imageId = "test-id";
+        var existingInfo = new ImageInfo
+        {
+            Id = imageId,
+            BlobName = "original/old_original.jpg"
+        };
+
+        var newFile = TestImageHelper.CreateTestImageFile("updated.png", 1000, 800);
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(existingInfo);
+
+        _mockImageRepository.Setup(x => x.UpdateAsync(It.IsAny<ImageInfo>()))
+            .Returns(Task.CompletedTask);
+
+        _mockBlobService.Setup(x => x.DeleteAsync(It.IsAny<string>()))
+            .Returns(Task.CompletedTask);
+
+        _mockBlobService.Setup(x => x.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.UpdateImageAsync(imageId, newFile);
+
+        Assert.NotNull(result);
+        Assert.Equal(imageId, result.Id);
+        _mockImageRepository.Verify(x => x.UpdateAsync(It.IsAny<ImageInfo>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GetAvailableResolutionsAsync_SmallImage_StillIncludesThumbnail()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 100,
+            OriginalHeight = 80
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        var result = await _imageService.GetAvailableResolutionsAsync(imageId);
+
+        Assert.NotNull(result);
+        var resolutions = result.ToList();
+        
+        Assert.Contains("original", resolutions);
+        Assert.DoesNotContain("small", resolutions);
+        Assert.DoesNotContain("medium", resolutions);
+    }
+
+    [Fact]
+    public async Task DownloadImageWithResolution_InvalidResolution_ReturnsNull()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        var result = await _imageService.DownloadImageWithResolutionAsync(imageId, "invalid");
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task DownloadImageWithResolution_OriginalResolution_CallsDownloadImageAsync()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600,
+            BlobName = "original/test_original.jpg",
+            ContentType = "image/jpeg",
+            OriginalFileName = "test.jpg"
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(imageInfo.BlobName))
+            .ReturnsAsync(true);
+
+        _mockBlobService.Setup(x => x.DownloadAsync(imageInfo.BlobName))
+            .ReturnsAsync(new MemoryStream(TestImageHelper.CreateTestImageBytes()));
+
+        var result = await _imageService.DownloadImageWithResolutionAsync(imageId, "original");
+
+        Assert.NotNull(result);
+        Assert.Equal("image/jpeg", result.ContentType);
+        Assert.Equal("test.jpg", result.FileName);
+    }
+
+    [Fact]
+    public async Task GeneratePredefinedResolutionsAsync_ImageExactly160Height_GeneratesThumbnail()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 213,
+            OriginalHeight = 160,
+            BlobName = "original/exact_original.jpg"
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.Is<string>(s => s.Contains("160h"))))
+            .ReturnsAsync(false);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.Is<string>(s => s.Contains("320h") || s.Contains("640h") || s.Contains("1024h") || s.Contains("1920h"))))
+            .ReturnsAsync(false);
+
+        _mockBlobService.Setup(x => x.DownloadAsync(imageInfo.BlobName))
+            .ReturnsAsync(new MemoryStream(TestImageHelper.CreateTestImageBytes(213, 160)));
+
+        _mockBlobService.Setup(x => x.UploadAsync(It.Is<string>(s => s.Contains("160h")), It.IsAny<Stream>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.GeneratePredefinedResolutionsAsync(imageId);
+
+        Assert.NotNull(result);
+        Assert.Contains("thumbnail", result.GeneratedResolutions);
+        Assert.Contains("small (exceeds original dimensions)", result.SkippedResolutions);
+    }
+
+    [Fact]
+    public async Task GeneratePredefinedResolutionsAsync_ThumbnailAlreadyExists_SkipsThumbnail()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600,
+            BlobName = "original/test_original.jpg"
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.Is<string>(s => s.Contains("160h"))))
+            .ReturnsAsync(true);
+
+        _mockBlobService.Setup(x => x.ExistsAsync(It.Is<string>(s => s.Contains("320h") || s.Contains("640h") || s.Contains("1024h") || s.Contains("1920h"))))
+            .ReturnsAsync(false);
+
+        _mockBlobService.Setup(x => x.DownloadAsync(imageInfo.BlobName))
+            .ReturnsAsync(new MemoryStream(TestImageHelper.CreateTestImageBytes()));
+
+        _mockBlobService.Setup(x => x.UploadAsync(It.IsAny<string>(), It.IsAny<Stream>()))
+            .Returns(Task.CompletedTask);
+
+        var result = await _imageService.GeneratePredefinedResolutionsAsync(imageId);
+
+        Assert.NotNull(result);
+        Assert.Contains("thumbnail (already exists)", result.SkippedResolutions);
+
+    }
+
+
+    [Fact]
+    public async Task GetResizedImageAsync_RequestHeightLargerThanOriginal_ReturnsNull()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        var result = await _imageService.GetResizedImageAsync(imageId, null, 800);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task GetResizedImageAsync_RequestWidthLargerThanOriginal_ReturnsNull()
+    {
+        var imageId = "test-id";
+        var imageInfo = new ImageInfo
+        {
+            Id = imageId,
+            OriginalWidth = 800,
+            OriginalHeight = 600
+        };
+
+        _mockImageRepository.Setup(x => x.GetByIdAsync(imageId))
+            .ReturnsAsync(imageInfo);
+
+        var result = await _imageService.GetResizedImageAsync(imageId, 1000, null);
+
+        Assert.Null(result);
     }
 
     #region Helper Methods
