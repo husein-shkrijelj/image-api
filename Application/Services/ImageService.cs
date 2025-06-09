@@ -151,32 +151,22 @@ public class ImageService : IImageService
                 _logger.LogDebug("Using default PNG extension for file {FileName}", file.FileName);
             }
 
-            // Get image dimensions and upload in one pass
             int imageHeight, imageWidth;
             var storageBlobName = $"{BlobPaths.OriginalPrefix}/{id}{BlobPaths.OriginalSuffix}{fileExtension}";
 
-            using (var fileStream = file.OpenReadStream())
+            // Read file content once
+            using var fileStream = file.OpenReadStream();
+            
+            // Get dimensions without re-encoding
+            using (var imageForDimensions = Image.Load(fileStream))
             {
-                // Load image to get dimensions
-                using (var image = Image.Load(fileStream))
-                {
-                    imageHeight = image.Height;
-                    imageWidth = image.Width;
-
-                    // Reset stream position and save as PNG directly to blob storage
-                    fileStream.Position = 0;
-                    using (var image2 = Image.Load(fileStream))
-                    using (var outputStream = new MemoryStream())
-                    {
-                        // Save as PNG for consistency
-                        image2.SaveAsPng(outputStream);
-                        outputStream.Position = 0;
-
-                        // Upload to blob storage
-                        await _blobService.UploadAsync(storageBlobName, outputStream);
-                    }
-                }
+                imageHeight = imageForDimensions.Height;
+                imageWidth = imageForDimensions.Width;
             }
+
+            // Reset stream and upload original bytes directly (preserve original format and quality)
+            fileStream.Position = 0;
+            await _blobService.UploadAsync(storageBlobName, fileStream);
 
             // Create image info record
             var imageInfo = new ImageInfo
@@ -198,7 +188,7 @@ public class ImageService : IImageService
             // Cache the newly created image info immediately
             CacheImageInfo(id, imageInfo, CacheItemPriority.High);
 
-            _logger.LogInformation("Successfully uploaded image {ImageId} with dimensions {Width}x{Height}",
+            _logger.LogInformation("Successfully uploaded image {ImageId} with dimensions {Width}x{Height}", 
                 id, imageWidth, imageHeight);
 
             // Fire-and-forget thumbnail generation for performance (only if image is large enough)
@@ -678,7 +668,6 @@ public class ImageService : IImageService
         }
     }
 
-    [Obsolete("Use GetResizedImageAsync instead. This method will be removed in a future version.")]
     public async Task<ResizedImageUrlResultDto?> GetResizedImageUrlAsync(string id, int height)
     {
         try

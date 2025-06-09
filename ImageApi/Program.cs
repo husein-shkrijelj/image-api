@@ -1,10 +1,14 @@
 using ImageApi.Application.Interfaces;
 using ImageApi.Application.Services;
+using ImageApi.Helpers;
 using ImageApi.Infrastructure.Config;
 using ImageApi.Infrastructure.Data;
 using ImageApi.Infrastructure.Storage;
 using Infrastructure.Data.Repository;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.OpenApi.Models;
+using Swashbuckle.AspNetCore.SwaggerGen;
+using System.Reflection;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,12 +22,43 @@ builder.Configuration
 // 1. Add services to the container.
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
 
-// 2. Add Memory Cache FIRST - before other services that depend on it
+// 2. Configure Swagger with XML documentation
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "Image API",
+        Version = "v1",
+        Description = "A comprehensive API for image upload, storage, and dynamic resizing operations.",
+        Contact = new OpenApiContact
+        {
+            Name = "Husein Skrijelj",
+            Email = "husein.shkrijelj@gmail.com"
+        }
+    });
+
+    // Include XML comments
+    var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+    var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
+    c.IncludeXmlComments(xmlPath);
+
+    // Optional: Include XML comments from other assemblies (like Application layer)
+    var applicationXmlFile = "Application.xml";
+    var applicationXmlPath = Path.Combine(AppContext.BaseDirectory, applicationXmlFile);
+    if (File.Exists(applicationXmlPath))
+    {
+        c.IncludeXmlComments(applicationXmlPath);
+    }
+
+    // Configure file upload support in Swagger UI
+    c.OperationFilter<FileUploadOperationFilter>();
+});
+
+// 3. Add Memory Cache FIRST - before other services that depend on it
 builder.Services.AddMemoryCache();
 
-// 3. Register DbContext with connection string from configuration
+// 4. Register DbContext with connection string from configuration
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 builder.Services.AddDbContext<ImageDbContext>(options =>
     options.UseSqlServer(connectionString, sqlOptions =>
@@ -38,16 +73,23 @@ builder.Services.AddDbContext<ImageDbContext>(options =>
 builder.Services.Configure<AzureBlobSettings>(
     builder.Configuration.GetSection(nameof(AzureBlobSettings)));
 
-// 4. Register application and infrastructure services
+// 5. Register application and infrastructure services
 builder.Services.AddScoped<IImageService, ImageService>();
 builder.Services.AddScoped<IAzureBlobStorageService, AzureBlobStorageService>();
 builder.Services.AddScoped<IImageRepository, ImageRepository>();
 
 var app = builder.Build();
 
+// 6. Configure the HTTP request pipeline.
 app.UseSwagger();
-
-app.UseSwaggerUI();
+app.UseSwaggerUI(c =>
+{
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Image API v1");
+    c.RoutePrefix = "swagger"; // Makes Swagger UI available at root URL
+    c.DocumentTitle = "Image API Documentation";
+    c.DefaultModelsExpandDepth(-1); // Hide schemas section by default
+    c.DisplayRequestDuration();
+});
 
 app.UseHttpsRedirection();
 
