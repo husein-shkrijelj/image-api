@@ -1064,6 +1064,8 @@ public class ImageService : IImageService
         blobsToDelete.Add($"{BlobPaths.ThumbnailsPrefix}/{id}{BlobPaths.ThumbnailSuffix}{FileExtensions.Png}");
 
         // Add common custom sizes
+        // These sizes are commonly used, so we delete them all at once
+        // FIXME: This can be the issue if user adds a custom size that is not in the common sizes list
         var commonSizes = new[] { 160, 320, 640, 800, 1024, 1200, 1600, 1920 };
         foreach (var size in commonSizes)
         {
